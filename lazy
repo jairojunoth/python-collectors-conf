@@ -1,0 +1,971 @@
+#!/usr/bin/python
+
+import re
+import sys
+import socket
+import time
+import os
+import getpass
+import hashlib
+import json
+import urllib
+import urllib2
+import urlparse
+import csv
+
+_url_base_ = 'http://localhost:1234/collectors'
+_filepath_ = None
+_text_ = None
+_agent_ = None
+
+def rawpretty(d, indent=0):
+	if 'name' in d:
+		print '\t' * indent + str(d['name'])
+		indent += 1
+	for key, value in d.items():
+		if key == 'name':
+			continue
+		if isinstance(value, str) or isinstance(value, int):
+			if value is None:
+				print '\t' * indent + str(key) + ': None'
+			else:
+				print '\t' * indent + str(key) + ': ' + str(value)
+			continue
+		if isinstance(value, dict):
+			print '\t' * indent + str(key)
+			rawpretty(value, indent+1)
+		elif isinstance(value, list):
+			print '\t' * indent + str(key)
+			for index, x in enumerate(value):
+				rawpretty(x, indent+1)
+				print ''
+		else:
+			if value is None:
+				print '\t' * (indent+1) + 'None'
+			else:
+				print '\t' * indent + str(key) + ': ' + str(value)
+pass
+
+def pretty(d, indent=0):
+	if 'name' in d:
+		print '\t' * indent + '\033[91m' + str(d['name']) + '\033[0m'
+		indent += 1
+	for key, value in d.items():
+		if key == 'name':
+			continue
+		if isinstance(value, str) or isinstance(value, int):
+			if value is None:
+				print '\t' * indent + '\033[91m' + str(key) + '\033[0m' + ': None'
+			else:
+				print '\t' * indent + '\033[91m' + str(key) + '\033[0m' + ': ' + str(value)
+			continue
+		if isinstance(value, dict):
+			print '\t' * indent + '\033[91m' + str(key) + '\033[0m'
+			pretty(value, indent+1)
+		elif isinstance(value, list):
+			print '\t' * indent + '\033[91m' + str(key) + '\033[0m'
+			for index, x in enumerate(value):
+				pretty(x, indent+1)
+				print ''
+		else:
+			if value is None:
+				print '\t' * (indent+1) + 'None'
+			else:
+				print '\t' * indent + '\033[91m' + str(key) + '\033[0m' + ': ' + str(value)
+pass
+
+def printerror(msg):
+	formatter = '\033[91m{0}\033[0m'
+	print formatter.format(msg)
+pass
+
+
+def ask_delete(hashid, strikes):
+	printerror('\nElements with the same hashid: ' + hashid + '\n')
+	answer = raw_input('\033[91m[WARNING] Are you sure you wanna delete this item? (y/n): \033[0m').upper().strip()
+	if answer == 'Y' or answer == 'YES':
+		try:
+			url = _url_base_ + '/json/' + hashid
+			req = urllib2.Request(url, None)
+			req.get_method = lambda: 'DELETE'  # creates the delete method
+			response = urllib2.urlopen(req)
+			if response.getcode() == 200:
+				data = json.loads(response.read())
+				columns = ['hashid', 'status']
+				col_format = "\033[95m\033[4m{0:32}\033[0m\033[95m\033[4m{1:25}\033[0m"
+				row_format = "\033[95m{0:32}\033[0m {1:25}"
+				print col_format.format(*['', ''])
+				print col_format.format(*columns)
+				print ""
+				item = [data['hashid'], '\033[91m Deleted \033[0m' if data['affectedRows'] > 0 else 'Not deleted or item does not exists.']
+				print row_format.format(*item)
+				print ""
+			elif response.getcode() == 500:
+				print response.read()
+		except urllib2.HTTPError, error:
+			print error.read()
+	elif answer == 'N' or answer == 'NO':
+		printerror('\nOk. Quiting program!\n')
+		sys.exit()
+	else:
+		strikes += 1
+		if strikes == 3:
+			printerror('\nToo many strikes. Quiting program!\n')
+			sys.exit()
+		else:
+			printerror('Not a valid option.')
+			ask_delete(sinks, strikes)
+pass
+
+
+def delete(id):
+	item = get(id, False)
+	filter(item['hashid'])
+	ask_delete(item['hashid'], strikes=0)
+pass
+
+
+def list_sinks(sinks):
+	col_format = "\033[95m\033[4m{0:20}\033[0m\033[95m\033[4m{1:50}\033[0m"
+	row_format = "\033[95m\033[1m{0:<20}\033[0m{1:50}\033[0m"
+	print col_format.format(*['', ''])
+	print col_format.format(*['key', 'value'])
+	for snk in sinks:
+		print ''
+		snktype = str(snk['type'])
+		bdm_type = snktype[snktype.rfind('.') +1 :len(snktype)]
+		print row_format.format(*['name', snk['name']])
+		print row_format.format(*['type', bdm_type])
+		detail_keys = []
+		detail_values = []
+		if 'specs' in snk:
+			detail_keys = snk['specs'].keys()
+			detail_values = snk['specs'].values()
+		if not detail_keys is None:
+			for index, key in enumerate(detail_keys):
+				if 'serializer' in key:
+					value = detail_values[index]
+					serializer = value[value.rfind('.') + 1:len(value)]
+					print row_format.format(*[key, serializer])
+					continue
+				if 'tool' in key:
+					value = detail_values[index]
+					if value is None:
+						print row_format.format(*[key, '\033[91m\033[4mNone\033[0m'])
+					else:
+						print row_format.format(*[key, '\033[92m\033[4m' + value + '\033[0m'])
+					continue
+				print row_format.format(*[key, detail_values[index]])
+		print col_format.format(*['', ''])
+	print ''
+pass
+
+
+def ask_toolname_forall_sink(sinks, strikes):
+	tool = raw_input('Set a tool name for missing the sinks: ').strip()
+	if len(tool) == 0:
+		strikes += 1
+		if strikes == 3:
+			printerror('\nToo many strikes. Quiting program!\n')
+			sys.exit()
+		else:
+			printerror('Not a valid option.')
+			ask_toolname_forall_sink(sinks, strikes)
+	else:
+		for snk in sinks:
+			if 'specs' not in snk:
+				snk['specs'] = {'tool': None}
+			snk['specs']['tool'] = tool
+pass
+
+
+def ask_toolname_foreach_sink(sinks, strikes):
+	for snk in sinks:
+		if 'specs' not in snk:
+			snk['specs'] = {'tool': None}
+		tool = raw_input('Set a tool name for the sink \'' + snk['name'] + '\': ').strip()
+		if len(tool) == 0:
+			strikes += 1
+			if strikes == 3:
+				print '\nToo many strikes. Quiting program!\n'
+				sys.exit()
+			else:
+				print 'Not a valid option.'
+				ask_toolname_foreach_sink(sinks, strikes)
+		else:
+			snk['specs']['tool'] = tool
+pass
+
+
+def ask_toolnames(sinks, strikes):
+	sink_without_tool = []
+	for snk in sinks:
+		if 'specs' in snk:
+			if 'tool' not in snk['specs']:
+				sink_without_tool.append(snk)
+			else:
+				if snk['specs']['tool'] is None or len(snk['specs']['tool'].strip()) == 0:
+					sink_without_tool.append(snk)
+		else:
+			sink_without_tool.append(snk)
+	if len(sink_without_tool) == 0:
+		return
+	for_all_sink = raw_input('Do you wanna set a tool name for all the missing sinks? (y/n): ').upper().strip()
+	if for_all_sink == 'Y' or for_all_sink == 'YES':
+		ask_toolname_forall_sink(sink_without_tool, strikes=0)
+	elif for_all_sink == 'N' or for_all_sink == 'NO':
+		ask_toolname_foreach_sink(sink_without_tool, strikes=0)
+	else:
+		strikes += 1
+		if strikes == 3:
+			printerror('\nToo many strikes. Quiting program!\n')
+			sys.exit()
+		else:
+			printerror('Not a valid option.')
+			ask_toolnames(sinks, strikes)
+pass
+
+
+def ask_project(metadata, strikes):
+	project = raw_input('Set the project (BDR/BDM) : ').upper().strip()
+	if project == 'BDR' or project == 'BDM':
+		metadata['project'] = project
+	else:
+		strikes += 1
+		if strikes == 3:
+			printerror('\nToo many strikes. Quiting program!\n')
+			sys.exit()
+		else:
+			printerror('Not a valid option.')
+			ask_project(metadata, strikes)
+pass
+
+
+def ask_environment(metadata, strikes):
+	environment = raw_input('Set the environment (PRD/HK) : ').upper().strip()
+	if environment == 'PRD' or environment == 'HK':
+		metadata['environment'] = environment
+	else:
+		strikes += 1
+		if strikes == 3:
+			printerror('\nToo many strikes. Quiting program!\n')
+			sys.exit()
+		else:
+			printerror('Not a valid option.')
+			ask_environment(metadata, strikes)
+pass
+
+
+def ask_send_info(config, strikes):
+	answer = raw_input('\n\033[91m[WARNING] Do you wanna send this info? (y/n): \033[0m').upper().strip()
+	if len(answer) == 0:
+		strikes += 1
+		if strikes == 3:
+			printerror('\nToo many strikes. Quiting program!\n')
+			sys.exit()
+		else:
+			printerror('Not a valid option.')
+			ask_send_info(config, strikes)
+	if answer == 'Y' or answer == 'YES':
+		print "\nOk, sending info...",
+		send(config)
+	elif answer == 'N' or answer == 'NO':
+		printerror('\nOk. Quiting program!\n')
+		sys.exit()
+pass
+
+
+def send(config):
+	print _url_base_
+	req = urllib2.Request(_url_base_, data=json.dumps(config), headers={'Content-type': 'application/json'})
+	opener = urllib2.build_opener()
+	try:
+		f = opener.open(req)
+		if f.getcode() == 200:
+			print "response: "
+			data = json.loads(f.read())
+			columns = ['bdm_id', 'name', 'status']
+			col_format = "\033[95m\033[4m{0:10}\033[0m \033[95m\033[4m{1:25}\033[0m \033[95m\033[4m{2:25}\033[0m"
+			row_format = "\033[95m{0:10}\033[0m {1:25} \033[92m{2:25}\033[0m"
+			print col_format.format(*['', '', ''])
+			print col_format.format(*columns)
+			for row in data:
+				item = [row['collector']['bdm_id'], row['collector']['tool'], row['status']]
+				print row_format.format(*item)
+			print ""
+	except urllib2.HTTPError, error:
+		printerror(error.read())
+		sys.exit()
+pass
+
+
+def put():
+	config = configs()
+	metadata = config['metadata']
+	sinks = config['configs']['sinks']
+	list_sinks(sinks)
+	print ""
+	ask_environment(metadata, strikes=0)
+	ask_project(metadata, strikes=0)
+	ask_toolnames(sinks, strikes=0)
+	ask_send_info(config, strikes=0)
+pass
+
+
+def get(id, printoption=True):
+	req = urllib2.Request(_url_base_ + '/json/' + id)
+	opener = urllib2.build_opener()
+	try:
+		f = opener.open(req)
+		if f.getcode() == 200:
+			data = json.loads(f.read())
+			if (not printoption):
+				return data
+			columns = data.keys()
+			values = data.values()
+			col_format = "\033[95m\033[4m{0:20}\033[0m\033[95m\033[4m{1:100}\033[0m"
+			row_format = "\033[95m{0:<20}\033[0m {1:<100}"
+			print col_format.format(*['', ''])
+			print col_format.format(*['column', 'value'])
+			print ''
+			for index, value in enumerate(values):
+				print row_format.format(columns[index], value)
+			print ''
+	except urllib2.HTTPError, error:
+		print error.read()
+		sys.exit()
+pass
+
+
+def getconfig(id):
+	req = urllib2.Request(_url_base_ + '/json/config/' + id)
+	opener = urllib2.build_opener()
+	try:
+		f = opener.open(req)
+		if f.getcode() == 200:
+			data = json.loads(f.read())
+			json_config = json.loads(data['config'])
+			pretty(json_config)
+			print ''
+	except urllib2.HTTPError, error:
+		print error.read()
+		sys.exit()
+pass
+
+def getrawconfig(id):
+	req = urllib2.Request(_url_base_ + '/json/config/' + id)
+	opener = urllib2.build_opener()
+	try:
+		f = opener.open(req)
+		if f.getcode() == 200:
+			data = json.loads(f.read())
+			json_config = json.loads(data['config'])
+			rawpretty(json_config)
+			print ''
+	except urllib2.HTTPError, error:
+		print error.read()
+		sys.exit()
+pass
+
+
+def listall():
+	req = urllib2.Request(_url_base_ + '/json')
+	opener = urllib2.build_opener()
+	f = opener.open(req)
+	if f.getcode() == 200:
+		data = json.loads(f.read())
+		if len(data) == 0:
+			print '\nNo items found\n'
+			return
+		columns = ['bdm_id', '', '', 'tool', 'host', 'sourcetype', 'path']
+		col_format = "\033[95m\033[4m{0:^10}\033[0m\033[95m\033[4m{1:^5}\033[0m\033[95m\033[4m{2:^5}\033[0m\033[95m\033[4m{3:^24}\033[0m\033[95m\033[4m{4:^32}\033[0m\033[95m\033[4m{5:^28}\033[0m\033[95m\033[4m{6:^50}\033[0m"
+		row_format = "\033[95m{0:<10}\033[0m {1:<5} {2:<5} {3:<24} {4:<32} {5:<28} {6:<50}"
+		print col_format.format(*['', '', '', '', '', '', ''])
+		print col_format.format(*columns)
+		print ""
+		for row in data:
+			item = [row['bdm_id'], row['project'], row['environment'], row['tool'], row['host'], row['sourcetype'], row['path']]
+			print row_format.format(*item)
+		print ""
+pass
+
+
+def filter(text):
+	req = urllib2.Request(_url_base_ + '/filter', data=json.dumps({'query': text}), headers={'Content-type': 'application/json'})
+	opener = urllib2.build_opener()
+	f = opener.open(req)
+	if f.getcode() == 200:
+		data = json.loads(f.read())
+		if len(data) == 0:
+			print '\nNo items found\n'
+			return
+		columns = ['bdm_id', '', '', 'tool', 'host', 'sourcetype', 'path']
+		col_format = "\033[95m\033[4m{0:10}\033[0m\033[95m\033[4m{1:^5}\033[0m\033[95m\033[4m{2:^5}\033[0m\033[95m\033[4m{3:^24}\033[0m\033[95m\033[4m{4:^32}\033[0m\033[95m\033[4m{5:^28}\033[0m\033[95m\033[4m{6:^50}\033[0m"
+		row_format = "\033[95m{0:<10}\033[0m {1:<5} {2:<5} {3:<24} {4:<32} {5:<28} {6:<50}"
+		print col_format.format(*['', '', '', '', '', '', ''])
+		print col_format.format(*columns)
+		print ""
+		for row in data:
+			item = [row['bdm_id'], row['project'], row['environment'], row['tool'], row['host'], row['sourcetype'], row['path']]
+			print row_format.format(*item)
+		print ""
+pass
+
+
+def readfile(filename):
+	f = open(filename)
+	content = f.read()
+	f.close()
+	return content
+
+
+def specs_regex(component, name, array):
+	patterns = []
+	for prop in array:
+		p_prop = re.compile(r'^[^\#][\w-]+.' + re.escape(component) + r'.' + re.escape(name) + r'.' + re.escape(prop) + r'\s*=\s*([^\s+]+)\s*$', re.MULTILINE)
+		patterns.append(p_prop)
+	return patterns
+
+
+def components_regex(component, name, array):
+	patterns = []
+	for prop in array:
+		p_prop = re.compile(r'^[^\#][\w-]+.' + re.escape(component) + r'.' + re.escape(name) + r'.' + re.escape(prop) + r'\s*=\s*([^\s+]+)\s*$', re.MULTILINE)
+		patterns.append(p_prop)
+	return patterns
+
+
+def jdbc_collect_regex(collectorname, array):
+	patterns = []
+	for prop in array:
+		p_prop = re.compile(r'^' + re.escape(collectorname) + r'.' + re.escape(prop) + r'\s*=\s*([^\s+]+)\s*$', re.MULTILINE)
+		patterns.append(p_prop)
+	return patterns
+
+
+def agent():
+	p_source = re.compile(r'^([^\#\s*][\w-]+).sources\s*=\s*[\w+ ]+\s*$', re.MULTILINE)
+	p_sinks = re.compile(r'^([^\#\s*][\w-]+).sinks\s*=\s*[\w+ ]+\s*$', re.MULTILINE)
+	match_source = re.findall(p_source, _text_)
+	match_sinks = re.findall(p_sinks, _text_)
+	if len(match_source) == 0 or len(match_sinks) == 0:
+		raise Exception('No agent was found.')
+	if match_source[0] == match_sinks[0]:
+		return match_source[0]
+	else:
+		raise Exception('agent must have sinks & sources')
+pass
+
+
+def sources():
+	p = re.compile(r'^[^\#][\w-]+.sources\s*=\s*([\w+ ]+)\s*$', re.MULTILINE)
+	match = re.findall(p, _text_)
+	result = re.compile(r'\s+').split(match[0].strip())
+	return result
+
+
+def source_types(sources):
+	results = []
+	for x in sources:
+		p = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(x) + r'.type\s*=\s*([\w+ .]+)\s*$', re.MULTILINE)
+		match = re.findall(p, _text_)
+		results.append(match[0])
+	return results
+
+
+def source_kafka_specs(source):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+ .]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.KafkaSource'):
+		return None
+	properties = ['zookeeperConnect', 'topic']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[properties[index]] = match[0]
+
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+
+def source_mq_specs(source):
+	specs = {}
+	p_type = p = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+ .]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.MQSource'):
+		return None
+	properties = ['mq.hostname', 'mq.manager', 'queue']
+	specskeys = ['hostname', 'manager', 'queue']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[specskeys[index]] = match[0]
+
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+
+def source_tcp_specs(source):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.OpenBusTcpSource'):
+		return None
+	properties = ['host', 'port']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[properties[index]] = match[0]
+
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+
+def source_jdbc_specs(source):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.OpenBusJDBCSource'):
+		return None
+	properties = ['propertiesDir', 'collectorName']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[properties[index]] = match[0]
+
+	configdir = specs['propertiesDir']
+	if configdir.startswith('./'):
+		configdir = configdir[2:]
+	cwd = os.path.dirname(os.path.abspath(_filepath_))
+	configfile_path = os.path.join(cwd, configdir)
+	collect_filename = os.path.join(configfile_path, 'collect.properties')
+	try:
+		collect_file_content = readfile(collect_filename)
+		collect_file_properties = ['collect.jdbc.connection.string', 'collect.jdbc.driver.class']
+		collect_keys = ['connectionString', 'driverclass']
+		collect_patterns = jdbc_collect_regex(specs['collectorName'], collect_file_properties)
+		for index, p in enumerate(collect_patterns):
+			match = re.findall(p, collect_file_content)
+			if len(match) == 0:
+				raise Exception(specs['collectorName'] + '.' + collect_file_properties[index] + ' property was not found.')
+			else:
+				specs[collect_keys[index]] = match[0]
+	except IOError as e:
+		print e.strerror + '. File: ' + collect_filename
+
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+
+def source_rest_specs(source):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.RestSource'):
+		return None
+	properties = ['url']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[properties[index]] = match[0]
+
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+def source_snmp_specs(source):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.SNMPSource'):
+		return None
+	properties = ['address', 'snmpTrapPort', 'snmpTrapVersion']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[properties[index]] = match[0]
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+def source_restserver_specs(source):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sources.' + re.escape(source) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	srctype = re.findall(p_type, _text_)[0]
+	if not srctype.endswith('.RESTServerSource'):
+		return None
+	properties = ['provider', 'spark.port']
+	specskeys = ['provider', 'port']
+	patterns = specs_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + source + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[specskeys[index]] = match[0]
+	return {'name': source, 'type': srctype, 'specs': specs}
+
+
+def source_specs(source):
+	fields = {}
+	properties = ['type']
+	patterns = components_regex('sources', source, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sources.' + re.escape(source) + r'.' + properties[index] + ' property was not found.')
+		else:
+			fields[properties[index]] = match[0]
+
+	srctype = fields['type']
+	if srctype.endswith('.MQSource'):
+		return source_mq_specs(source)
+	elif srctype.endswith('.KafkaSource'):
+		return source_kafka_specs(source)
+	elif srctype.endswith('.OpenBusTcpSource'):
+		return source_tcp_specs(source)
+	elif srctype.endswith('.OpenBusJDBCSource'):
+		return source_jdbc_specs(source)
+	elif srctype.endswith('.RestSource'):
+		return source_rest_specs(source)
+	elif srctype.endswith('.SNMPSource'):
+		return source_snmp_specs(source)
+	elif srctype.endswith('.RESTServerSource'):
+		return source_restserver_specs(source)
+	else:
+		raise Exception(_agent_ + ' source \'' + source + '\' specifications were not found.')
+
+
+def sinks():
+	p = re.compile(r'^[^\#][\w-]+.sinks\s*=\s*([\w+ ]+)\s*$', re.MULTILINE)
+	match = re.findall(p, _text_)
+	result = re.compile(r'\s+').split(match[0].strip())
+	return result
+
+
+def sink_hbase_specs(sink):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sinks.' + re.escape(sink) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	snktype = re.findall(p_type, _text_)[0]
+	if not snktype.endswith('.HBaseSink'):
+		return None
+	specskeys = ['table', 'kerberosPrincipal', 'kerberosKeytab', 'serializer']
+	patterns = specs_regex('sinks', sink, specskeys)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sinks.' + sink + '.' + specskeys[index] + ' property was not found.')
+		else:
+			specs[specskeys[index]] = match[0]
+	specs['tool'] = None
+	return {'name': sink, 'type': snktype, 'specs': specs}
+
+
+def sink_eventingestor_specs(sink):
+	global _filepath_
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sinks.' + re.escape(sink) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	snktype = re.findall(p_type, _text_)[0]
+	if not snktype.endswith('.EventIngestorSink'):
+		return None
+	p_dynamic = re.compile(r'^[^\#][\w-]+.sinks.' + re.escape(sink) + r'.openbus.config.dynamic\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	isdynamic = re.findall(p_dynamic, _text_)
+	if len(isdynamic) > 0 and isdynamic[0] == 'true':
+		p_configfile = re.compile(r'^[^\#][\w-]+.sinks.' + re.escape(sink) + r'.openbus.config\s*=\s*([^\s+]+)\s*$', re.MULTILINE)
+		configfile = re.findall(p_configfile, _text_)[0]
+		if configfile.startswith('./'):
+			configfile = configfile[2:]
+		#cwd = os.path.dirname(os.path.dirname(os.path.abspath(_filepath_)))
+		cwd = os.path.dirname(os.path.abspath(_filepath_))
+		configfile_path = os.path.join(cwd, configfile)
+		configfile_content = readfile(configfile_path)
+		p_tools = re.compile(r'(\w+)\s*=\s*\[\s*\"(\w+)\"\s*\]', re.MULTILINE)
+		tools = re.findall(p_tools, configfile_content)
+		tool = None
+		if len(tools) > 0:
+			print ''
+			for index, t in enumerate(tools):
+				print "{0}: {1}".format(index + 1, t[0])
+			print ''
+			selected_tool = int(raw_input('Choose a tool: '))
+			tool = tools[selected_tool - 1][0]
+		p_include = re.compile(r'^\s*include\s+classpath\(\"(.*)\"\)', re.MULTILINE)
+		include = re.findall(p_include, configfile_content)
+		if len(include) > 0:
+			for i in include:
+				if 'broker.conf' in i:
+					continue
+				wd = os.path.dirname(configfile_path)
+				_filepath_ = os.path.join(wd, i)
+				mappingfile_content = readfile(_filepath_)
+				p_toolinmapping = re.compile(r'^\s*(' + re.escape(tool) + r')\s*\{', re.MULTILINE)
+				toolinmapping = re.findall(p_toolinmapping, mappingfile_content)
+				print toolinmapping
+				if len(toolinmapping) > 0:
+					p_brokerlist = re.compile(r'brokerList\s*=\s*\"([^\s]+)\"', re.MULTILINE)
+					p_successTopic = re.compile(r'successTopic\s*=\s*\"([^\s]+)\"', re.MULTILINE)
+					p_failureTopic = re.compile(r'failureTopic\s*=\s*\"([^\s]+)\"', re.MULTILINE)
+					p_serializerClass = re.compile(r'serializerClass\s*=\s*\"([\w.]+)\"', re.MULTILINE)
+					brokerList = re.findall(p_brokerlist, mappingfile_content)[0]
+					successTopic = re.findall(p_successTopic, mappingfile_content)[0]
+					failureTopic = re.findall(p_failureTopic, mappingfile_content)[0]
+					serializerClass = re.findall(p_serializerClass, mappingfile_content)[0]
+					specs = {'brokerList': brokerList, 'successTopic': successTopic, 'failureTopic': failureTopic, 'serializerClass': serializerClass, 'tool': tool}
+					break
+	else:
+		specskeys = ['brokerList', 'successTopic', 'failureTopic', 'serializerClass', 'tool']
+		properties = ['metadata.broker.list', 'openbus.success.topic' , 'openbus.failure.topic', 'openbus.serializer.class', 'openbus.tool']
+		patterns = specs_regex('sinks', sink, properties)
+		for index, p in enumerate(patterns):
+			match = re.findall(p, _text_)
+			if len(match) == 0:
+				raise Exception(_agent_ + '.sinks.' + sink + '.' + properties[index] + ' property was not found.')
+			else:
+				specs[specskeys[index]] = match[0]
+	return {'name': sink, 'type': snktype, 'specs': specs}
+
+
+def sink_neo4j_specs(sink):
+	specs = {}
+	p_type = re.compile(r'^[^\#][\w-]+.sinks.' + re.escape(sink) + r'.type\s*=\s*([\w+.]+)\s*$', re.MULTILINE)
+	snktype = re.findall(p_type, _text_)[0]
+	if not snktype.endswith('.Neo4JSink'):
+		return None
+	specskeys = ['parserType', 'persistenceUrl', 'persistenceUsername']
+	properties = ['parser.type', 'persistence.url', 'persistence.username']
+	patterns = specs_regex('sinks', sink, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sinks.' + sink + '.' + properties[index] + ' property was not found.')
+		else:
+			specs[specskeys[index]] = match[0]
+	return {'name': sink, 'type': snktype, 'specs': specs}
+
+
+def sink_specs(sink):
+	fields = {}
+	properties = ['type']
+	patterns = components_regex('sinks', sink, properties)
+	for index, p in enumerate(patterns):
+		match = re.findall(p, _text_)
+		if len(match) == 0:
+			raise Exception(_agent_ + '.sinks.' + re.escape(sink) + r'.' + properties[index] + ' property was not found.')
+		else:
+			fields[properties[index]] = match[0]
+	if fields['type'].endswith('.EventIngestorSink'):
+		return sink_eventingestor_specs(sink)
+	elif fields['type'].endswith('.HBaseSink'):
+		return sink_hbase_specs(sink)
+	elif fields['type'].endswith('.Neo4JSink'):
+		return sink_neo4j_specs(sink)
+	else:
+		return {'name': sink, 'type': fields['type'], 'specs': {'tool': None}}
+
+
+def configs():
+	srclist = []
+	snklist = []
+	for src in sources():
+		srclist.append(source_specs(src))
+	for index, snk in enumerate(sinks()):
+		snklist.append(sink_specs(snk))
+	nodebugsink = []
+	for index, snk in enumerate(snklist):
+		if not snk['type'].endswith('.EventDebugSink'):
+			nodebugsink.append(snk)
+	snklist = nodebugsink
+	config = {'metadata': metadata(), 'configs': {'sources': srclist, 'sinks': snklist}}
+	return config
+
+
+def metadata():
+	hostname = socket.gethostname()
+	timestamp = time.time()
+	configfile = os.path.abspath(_filepath_)
+	username = getpass.getuser()
+	hash_id = hashlib.md5(hostname + configfile).hexdigest()
+	return {'hostname': hostname, 'timestamp': timestamp, 'path': configfile, 'username': username, 'hash_id': hash_id}
+
+
+def config_to_json():
+	config = configs()
+	metadata = config['metadata']
+	sinks = config['configs']['sinks']
+	list_sinks(sinks)
+	print ''
+	ask_environment(metadata, strikes=0)
+	ask_project(metadata, strikes=0)
+	ask_toolnames(sinks, strikes=0)
+	print '\n\033[91mJSON Result:\033[0m\n'
+	print '\033[92m' + (json.dumps(config, indent=4, ensure_ascii=False, sort_keys=True)) + '\033[0m\n'
+pass
+
+
+def make_csv(filename):
+	req = urllib2.Request(_url_base_ + 'json')
+	opener = urllib2.build_opener()
+	f = opener.open(req)
+	if f.getcode() == 200:
+		data = json.loads(f.read())
+		if len(data) == 0:
+			print '\nNo items found\n'
+			return
+		columns = [
+			'bdm_id',
+			'bdm_project',
+			'bdm_environment',
+			'bdm_tool',
+			'bdm_server',
+			'bdm_path',
+			'bdm_collector',
+			'bdm_type_collector',
+			'bdm_kafka_topic',
+			'bdm_mq_server',
+			'bdm_mq_queue',
+			'bdm_status',
+			'bdm_elasticsearch',
+			'bdm_hdfs',
+			'bdm_owner',
+			'bdm_doc']
+		with open(filename, 'wb') as csvfile:
+			writer = csv.DictWriter(csvfile, fieldnames=columns, delimiter=';')
+			writer.writeheader()
+			for row in data:
+				writer.writerow(row)
+		print 'Done. Output file path: ' + os.path.abspath(filename)
+pass
+
+
+# commands handling
+
+print sys.argv
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--filter':
+		try:
+			select_text = str(sys.argv[2])
+			filter(select_text)
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 2:
+	param = str(sys.argv[1])
+	if param == '--list':
+		try:
+			listall()
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--get':
+		try:
+			bdm_id = str(sys.argv[2])
+			get(bdm_id)
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--config':
+		try:
+			bdm_id = str(sys.argv[2])
+			getconfig(bdm_id)
+		except KeyboardInterrupt:
+			print '\n'
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--rawconfig':
+		try:
+			bdm_id = str(sys.argv[2])
+			getrawconfig(bdm_id)
+		except KeyboardInterrupt:
+			print '\n'
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--delete':
+		try:
+			bdm_id = str(sys.argv[2])
+			delete(bdm_id)
+		except KeyboardInterrupt:
+			print '\n'
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--put':
+		try:
+			_filepath_ = str(sys.argv[2])
+			_text_ = readfile(_filepath_)
+			_agent_ = agent()
+			put()
+		except KeyboardInterrupt:
+			print '\n'
+		except IOError as e:
+			printerror(e)
+		except Exception as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--csv':
+		try:
+			_filepath_ = str(sys.argv[2])
+			make_csv(_filepath_)
+		except KeyboardInterrupt:
+			print '\n'
+		except IOError as e:
+			printerror(e)
+		finally:
+			sys.exit()
+
+if len(sys.argv) == 3:
+	param = str(sys.argv[1])
+	if param == '--json':
+		try:
+			_filepath_ = str(sys.argv[2])
+			_text_ = readfile(_filepath_)
+			_agent_ = agent()
+			config_to_json()
+		except KeyboardInterrupt:
+			print '\n'
+		except IOError as e:
+			printerror(e)
+		except Exception as e:
+			printerror(e)
+		finally:
+			sys.exit()
